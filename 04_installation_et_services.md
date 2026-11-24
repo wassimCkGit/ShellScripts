@@ -27,6 +27,9 @@ Deux grandes familles de distributions, deux gestionnaires de paquets :
 |---------|---------------|--------------|
 | **Debian** | Debian, Ubuntu, Mint, Raspberry Pi OS | `apt` |
 | **RedHat** | RHEL, CentOS, Fedora, Rocky, Alma | `yum` (ancien) / `dnf` (actuel) |
+| **Alpine** | Alpine (habituellment avec docker)| `apk` |
+| **ArchLinux** | ArchLinux, Garudam,  ChatyOs, Manjaro (jamais sur serveur!!)| `pacman` |
+
 
 ### Préinstallation / mise à jour de l'index
 

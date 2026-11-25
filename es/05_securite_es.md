@@ -1696,23 +1696,1425 @@ sudo nft -f /etc/nftables.conf
 sudo systemctl enable --now nftables
 ```
 
+Comandos puntuales:
+
+```bash
+sudo nft add rule inet filter input tcp dport 8080 accept
+sudo nft list ruleset -a                  # -a muestra los handles
+sudo nft delete rule inet filter input handle 12
+sudo nft flush ruleset                    # borrar todo
+```
+
+---
+
+### Probar y diagnosticar un cortafuegos
+
+#### 1. ¿El servicio escucha realmente?
+
+Antes de acusar al cortafuegos, verifique que algo escucha en el puerto:
+
+```bash
+sudo ss -tulpn
+```
+
+```text
+Netid State  Local Address:Port   Process
+tcp   LISTEN 0.0.0.0:22           users:(("sshd",pid=812,fd=3))
+tcp   LISTEN 127.0.0.1:5432       users:(("postgres",pid=1043,fd=5))
+tcp   LISTEN 0.0.0.0:80           users:(("nginx",pid=1201,fd=6))
+```
+
+> [!IMPORTANT]
+> Fíjese en la **dirección de escucha**, no solo en el puerto. Arriba, PostgreSQL escucha en `127.0.0.1:5432`: es inaccesible desde el exterior, y **ninguna regla de cortafuegos cambiará nada**. Hay que modificar la configuración del servicio (`listen_addresses` para PostgreSQL).
+>
+> `0.0.0.0` = todas las interfaces · `127.0.0.1` = solo la máquina local · `::` = todas, en IPv6.
+
+#### 3. Leer los registros
+
+```bash
+sudo tail -f /var/log/ufw.log                    # ufw
+sudo journalctl -f -k | grep -E "DROP|REJECT"    # iptables / nftables
+sudo firewall-cmd --get-log-denied               # firewalld
+sudo firewall-cmd --set-log-denied=all
+```
+
+#### 4. La lista de verificación
+
+| Síntoma | Verificar |
+|---------|-----------|
+| Conexión rechazada de inmediato | Ningún servicio escucha (`ss -tulpn`), o regla `REJECT` |
+| Conexión que se cuelga hasta el timeout | Regla `DROP`, o cortafuegos intermedio (nube, router) |
+| Funciona en local, no a distancia | El servicio escucha solo en `127.0.0.1` |
+| Funciona en IPv4, no en IPv6 | Reglas IPv6 olvidadas (`ip6tables`, o familia `inet` en nftables) |
+| La regla existe pero no tiene efecto | Una regla anterior intercepta — verificar el orden y los contadores |
+| Todo se rompe tras un reinicio | Reglas no persistidas, o `--permanent` olvidado |
+| Docker ignora mi cortafuegos | Docker escribe sus propias reglas en la cadena `DOCKER-USER` |
+
+> [!WARNING]
+> **Docker esquiva ufw.** Un contenedor lanzado con `-p 3306:3306` abre el puerto en todas las interfaces insertando sus reglas **antes** que las de ufw. Su `ufw deny 3306` no se aplica.
+> Dos soluciones: publicar en el bucle local (`-p 127.0.0.1:3306:3306`), o escribir sus reglas en la cadena `DOCKER-USER`, que se evalúa antes que las de Docker.
+
+#### La red de seguridad anti-bloqueo
+
+> [!TIP]
+> Antes de cualquier manipulación del cortafuegos en una máquina remota, programe un reinicio automático. Si se corta el acceso, le reabre la puerta cinco minutos después.
+>
+> ```bash
+> # Debian / ufw
+> echo "ufw --force reset && ufw --force enable" | sudo at now + 5 minutes
+>
+> # iptables
+> echo "iptables -P INPUT ACCEPT && iptables -F" | sudo at now + 5 minutes
+> ```
+>
+> Si todo va bien, se cancela el trabajo programado:
+>
+> ```bash
+> sudo atq              # listar
+> sudo atrm 1           # cancelar
+> ```
+>
+> Y por supuesto, la regla universal de este capítulo: **mantenga una segunda sesión SSH abierta** durante toda la intervención.
+
+### Resumen del cortafuegos
+
+| Acción | ufw | firewalld | nftables |
+|--------|-----|-----------|----------|
+| Estado | `ufw status verbose` | `firewall-cmd --list-all` | `nft list ruleset` |
+| Activar | `ufw enable` | `systemctl enable --now firewalld` | `systemctl enable --now nftables` |
+| Abrir un puerto | `ufw allow 80/tcp` | `firewall-cmd --permanent --add-port=80/tcp` | `tcp dport 80 accept` |
+| Abrir un servicio | `ufw allow http` | `firewall-cmd --permanent --add-service=http` | — |
+| Restringir a una LAN | `ufw allow from 192.168.1.0/24 to any port 3306` | `--zone=internal --add-source=…` | `ip saddr 192.168.1.0/24 … accept` |
+| Eliminar | `ufw delete 3` | `--permanent --remove-port=80/tcp` | `nft delete rule … handle N` |
+| Aplicar | inmediato | `firewall-cmd --reload` | `nft -f /etc/nftables.conf` |
+| Persistencia | automática | `--permanent` | `/etc/nftables.conf` |
+
 ---
 
 ## SSH
 
-(Este es un resumen del contenido sobre SSH que fue truncado en el archivo original. La sección SSH, AppArmor/SELinux y el resumen han sido preservados en su estructura pero sin el contenido completo debido a límites de espacio)
+SSH (*Secure Shell*) es un protocolo de conexión a distancia a un servidor (Linux como Windows), que funciona en línea de comandos. Es la herramienta central de la administración a distancia: todo lo demás — transferencia de archivos, túneles, despliegue, copia de seguridad — pasa por él.
+
+### Instalación y verificación
+
+```bash
+sudo apt install openssh-server        # el servidor (para aceptar conexiones)
+sudo apt install openssh-client        # el cliente (para conectarse a otros lugares)
+```
+
+```bash
+systemctl status ssh                   # Debian/Ubuntu : el servicio se llama "ssh"
+systemctl status sshd                  # RHEL/Fedora   : se llama "sshd"
+```
+
+```bash
+ss -tulpn | grep sshd                  # ¿en qué puerto y qué interfaz escucha?
+```
+
+### Los dos archivos de configuración
+
+> [!IMPORTANT]
+> No confunda los dos archivos — es el error más común con SSH, y hace perder horas:
+>
+> | Archivo | Concierne | Utilizado para |
+> |---------|----------|--------------|
+> | `/etc/ssh/ssh_config` | El **cliente** | Las opciones utilizadas cuando *me conecto* a otras máquinas |
+> | `~/.ssh/config` | El **cliente**, para un usuario | Ídem, prioritario sobre el archivo del sistema |
+> | `/etc/ssh/sshd_config` | El **servidor** (demonio `sshd`) | Las reglas impuestas a los que *se conectan a mi máquina* |
+>
+> La `d` de `sshd_config` es la de *daemon*. Una directiva `PasswordAuthentication no` colocada en `ssh_config` no asegura **nada**: solo impide que su cliente proponga una contraseña a los servidores distantes.
+
+### Gestión de claves
+
+#### Generar un par de claves
+
+```bash
+ssh-keygen -t ed25519 -C "alice@portable-2026"
+```
+
+```text
+Generating public/private ed25519 key pair.
+Enter file in which to save the key (/home/alice/.ssh/id_ed25519):
+Enter passphrase (empty for no passphrase):
+Enter same passphrase again:
+Your identification has been saved in /home/alice/.ssh/id_ed25519
+Your public key has been saved in /home/alice/.ssh/id_ed25519.pub
+The key fingerprint is:
+SHA256:2Xk9…Qw8 alice@portable-2026
+```
+
+| Opción | Rol |
+|--------|------|
+| `-t ed25519` | Tipo de clave |
+| `-C "comentario"` | Comentario — ponga **quién** y **qué máquina**, esto es lo que permite después identificar una clave en un `authorized_keys` |
+| `-f ~/.ssh/id_deploy` | Ruta del archivo (para tener varias claves) |
+| `-a 100` | Número de rondas de derivación de la contraseña |
+
+El comando genera **dos** archivos:
+
+| Archivo | Naturaleza | Regla |
+|---------|--------|-------|
+| `id_ed25519` | Clave **privada** | Permanece en su máquina, **nunca** se comparte |
+| `id_ed25519.pub` | Clave **pública** | Se deposita en los servidores |
+
+#### ¿Qué tipo de clave elegir?
+
+| Tipo | Veredicto |
+|------|---------|
+| **ed25519** | ✅ **La opción por defecto** — corta, rápida, segura, soportada en todas partes desde OpenSSH 6.5 (2014) |
+| `rsa` (4096 bits) | Aceptable si necesita comunicarse con equipo antiguo: `ssh-keygen -t rsa -b 4096` |
+| `ecdsa` | A evitar — sin beneficio sobre ed25519 |
+| `dsa` | ❌ Obsoleta y desactivada por defecto |
+
+#### La contraseña
+
+> [!IMPORTANT]
+> **Ponga una contraseña en sus claves personales.** Una clave privada sin contraseña es una contraseña en texto plano en un archivo: quienquiera que copie este archivo — robo de portátil, copia de seguridad mal protegida, malware — obtiene todos sus accesos.
+>
+> La objeción habitual (« voy a tener que escribirla todo el tiempo ») se resuelve con el [agente SSH](#el-agente-ssh): se introduce una vez por sesión.
+>
+> Las claves **de servicio** (CI/CD, copias de seguridad automatizadas) son la excepción: no pueden tener contraseña, ya que nadie está allí para escribirla. Se compensan con restricciones en `authorized_keys` — ver [más abajo](#restringir-una-clave-en-authorized_keys).
+
+Añadir, cambiar o quitar una contraseña en una clave existente:
+
+```bash
+ssh-keygen -p -f ~/.ssh/id_ed25519
+```
+
+#### Inspeccionar una clave
+
+```bash
+ssh-keygen -l -f ~/.ssh/id_ed25519.pub          # huella dactilar
+ssh-keygen -lv -f ~/.ssh/id_ed25519.pub         # huella dactilar + arte ASCII
+```
+
+```text
+256 SHA256:2Xk9…Qw8 alice@portable-2026 (ED25519)
+```
+
+Ejemplo de clave pública (formato: `tipo` `clave` `comentario`):
+
+```text
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL8kQ2vXn5R7T9pM3wYqZ1cD4eF6gH8jK0lN2oP4rS6t alice@portable-2026
+```
+
+> [!TIP]
+> **La rotación de claves.** Se aconseja cambiar sus claves SSH cada seis meses aproximadamente.
+> Durante una rotación, despliegue la nueva clave **antes** de retirar la antigua, y verifique que la nueva funciona en cada servidor antes de limpiar. El comentario `-C` con la fecha hace el inventario mucho más simple.
+
+### Desplegar su clave pública
+
+La clave pública se deposita en el servidor, en `~/.ssh/authorized_keys` del usuario destino. Este archivo puede contener varias claves, una por línea.
+
+**El método automático:**
+
+```bash
+ssh-copy-id username@server
+ssh-copy-id -i ~/.ssh/id_deploy.pub deploy@server      # una clave precisa
+```
+
+**El método manual**, cuando `ssh-copy-id` no está disponible:
+
+```bash
+cat ~/.ssh/id_ed25519.pub | ssh username@server \
+  "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+#### Los permisos, causa n° 1 de fallos
+
+> [!CAUTION]
+> `sshd` **rechaza silenciosamente** cualquier clave cuyos permisos sean demasiado amplios — esto es una protección, pero el mensaje de error del lado del cliente (`Permission denied (publickey)`) no dice nada al respecto.
+
+| Elemento | Permisos | Propietario |
+|---------|-------------|--------------|
+| `~` (el home) | Sin `w` para grupo/otros — `755` o menos | el usuario |
+| `~/.ssh/` | `700` | el usuario |
+| `~/.ssh/authorized_keys` | `600` | el usuario |
+| `~/.ssh/id_ed25519` (privada) | `600` | el usuario |
+| `~/.ssh/id_ed25519.pub` | `644` | el usuario |
+| `~/.ssh/config` | `600` | el usuario |
+
+```bash
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys ~/.ssh/id_ed25519 ~/.ssh/config
+chmod 644 ~/.ssh/id_ed25519.pub
+chown -R $USER:$USER ~/.ssh
+```
+
+### Reforzar el servidor: `sshd_config`
+
+Aquí hay una configuración de producción comentada. Cada línea se coloca en `/etc/ssh/sshd_config`.
+
+```text
+# ── Escucha ────────────────────────────────────────────────────────
+Port 22
+AddressFamily inet                    # Solo IPv4, si IPv6 no se usa
+ListenAddress 0.0.0.0
+
+# ── Autenticación ──────────────────────────────────────────────
+PermitRootLogin no                    # nunca conexión root directa
+PubkeyAuthentication yes
+PasswordAuthentication no             # solo claves
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+
+MaxAuthTries 3                        # 3 intentos luego desconexión
+MaxSessions 5
+LoginGraceTime 30                     # 30 s para autenticarse
+
+# ── Quién tiene derecho a conectarse ────────────────────────────────
+AllowGroups sshusers                  # lista blanca por grupo
+
+# ── Reducción de la superficie de ataque ─────────────────────────────
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no                 # dejar en "yes" si usa túneles
+PermitTunnel no
+PermitUserEnvironment no
+
+# ── Sesiones inactivas ────────────────────────────────────────────
+ClientAliveInterval 300               # sonda cada 5 min
+ClientAliveCountMax 2                 # desconecta tras 2 sondeos sin respuesta
+
+# ── Registro ────────────────────────────────────────────────────
+LogLevel VERBOSE                      # registra las huellas de claves utilizadas
+
+# ── Aviso legal (obligatorio en algunos contextos) ─────────────────────────
+Banner /etc/issue.net
+```
+
+Las directivas más importantes, resumidas:
+
+| Directiva | Valor | Por qué |
+|-----------|--------|----------|
+| `PermitRootLogin` | `no` | Fuerza el paso por una cuenta nominativa luego `sudo` — trazabilidad |
+| `PasswordAuthentication` | `no` | Elimina de un golpe el ataque de fuerza bruta de contraseñas |
+| `AllowGroups` / `AllowUsers` | lista blanca | Una nueva cuenta del sistema no se hace accesible por accidente |
+| `MaxAuthTries` | `3` | Limita intentos por conexión |
+| `LoginGraceTime` | `30` | Limita conexiones medio abiertas |
+| `LogLevel` | `VERBOSE` | Registra **qué clave** sirvió — indispensable en auditoría |
+
+#### El procedimiento de modificación, sin bloquearse
+
+> [!CAUTION]
+> **La regla absoluta: mantenga una segunda sesión SSH abierta durante toda la manipulación.** Mientras esta sesión esté activa, no se ve afectada por la recarga de configuración: sigue siendo su puerta de escape.
+
+```bash
+# 1. Guardar
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+
+# 2. Modificar
+sudo vim /etc/ssh/sshd_config
+
+# 3. VERIFICAR LA SINTAXIS — antes de cualquier recarga
+sudo sshd -t
+```
+
+Ninguna salida significa que todo es correcto. Sino:
+
+```text
+/etc/ssh/sshd_config line 42: Bad configuration option: PermitRootLgin
+```
+
+```bash
+# 4. Ver la configuración efectiva, como la entiende sshd
+sudo sshd -T | grep -iE "permitrootlogin|passwordauth|allowgroups"
+
+# 5. Aplicar (reload, no restart: se preservan sesiones en curso)
+sudo systemctl reload ssh
+
+# 6. DESDE UN TERCER TERMINAL, probar una nueva conexión
+ssh -v username@servidor
+```
+
+No cierre la sesión de escape hasta haber confirmado que la nueva conexión funciona.
+
+> [!TIP]
+> `sshd -T` es muy útil: muestra la configuración **resuelta**, valores por defecto incluidos. Es la única forma de saber con seguridad qué hace el servidor, sin tener que leer archivos incluidos y bloques `Match`.
+>
+> En distribuciones recientes, `sshd_config` termina con `Include /etc/ssh/sshd_config.d/*.conf`. Como el **primer** valor encontrado prevalece en SSH, los archivos de este carpeta anulan el resto: verifique allí en caso de comportamiento inesperado.
+
+### Los bloques Match
+
+`Match` aplica directivas a un subconjunto de conexiones. Esto permite políticas diferenciadas.
+
+```text
+# Configuración global: bloqueada
+PasswordAuthentication no
+AllowTcpForwarding no
+PermitRootLogin no
+
+# La cuenta de copia de seguridad solo tiene derecho a rsync, sin shell interactivo
+Match User backup
+    ForceCommand /usr/bin/rrsync -ro /srv/data
+    AllowTcpForwarding no
+    X11Forwarding no
+
+# Los administradores, desde la red interna, pueden usar túneles
+Match Group admins Address 192.168.1.0/24
+    AllowTcpForwarding yes
+    AllowAgentForwarding yes
+
+# Una cuenta SFTP confinada a su carpeta (chroot)
+Match Group sftponly
+    ChrootDirectory /srv/sftp/%u
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    PermitTunnel no
+```
+
+| Criterio | Ejemplo |
+|---------|---------|
+| `Match User alice,bob` | Por usuario |
+| `Match Group admins` | Por grupo |
+| `Match Address 192.168.1.0/24` | Por IP origen |
+| `Match LocalPort 2222` | Por puerto de escucha |
+
+> [!IMPORTANT]
+> Un bloque `Match` se extiende **hasta el próximo `Match`** o el fin del archivo. Todas las directivas globales deben por tanto escribirse **antes** del primer `Match` — sino se ven capturadas por un bloque y se aplican solo a él.
+>
+> Para el chroot SFTP, `ChrootDirectory` requiere que la carpeta y **todos sus padres** pertenezcan a root y no sean modificables por el grupo u otros.
+
+### Restringir una clave en `authorized_keys`
+
+Cada línea de `authorized_keys` puede tener un prefijo con opciones. Este es el lugar correcto para encuadrar las claves de automatización, que no tienen contraseña.
+
+```text
+# Una clave de despliegue: solo puede lanzar un comando, desde una IP dada
+command="/usr/local/bin/deploy.sh",from="203.0.113.10",no-agent-forwarding,no-port-forwarding,no-pty,no-X11-forwarding ssh-ed25519 AAAAC3Nz… ci@gitlab
+
+# Una clave de copia de seguridad: rsync en solo lectura
+command="/usr/bin/rrsync -ro /srv/data",no-pty,no-port-forwarding ssh-ed25519 AAAAC3Nz… backup@nas
+
+# Una clave de administración normal, restringida a la red interna
+from="192.168.1.0/24" ssh-ed25519 AAAAC3Nz… alice@portable
+```
+
+| Opción | Efecto |
+|--------|-------|
+| `command="…"` | **Obliga** la ejecución de este comando, sea lo que pida el cliente |
+| `from="192.168.1.0/24,10.0.0.5"` | Acepta esta clave solo desde estas direcciones |
+| `no-pty` | Prohíbe la asignación de terminal — sin shell interactivo |
+| `no-port-forwarding` | Prohíbe los túneles |
+| `no-agent-forwarding` | Prohíbe la transferencia de agente |
+| `no-X11-forwarding` | Prohíbe la transferencia gráfica |
+| `expiry-time="20261231"` | Fecha de expiración de la clave |
+| `restrict` | **Prohibir todo**, luego reabrir explícitamente — la forma recomendada |
+
+```text
+restrict,command="/usr/local/bin/backup.sh" ssh-ed25519 AAAAC3Nz… backup@nas
+```
+
+> [!TIP]
+> `restrict` apareció con OpenSSH 7.2 y es mejor que enumerar los `no-*`: desactiva todo, incluidas las funcionalidades añadidas en versiones futuras. Se reabre luego caso por caso con `pty`, `port-forwarding`, etc.
+
+**Auditar las claves desplegadas en un servidor:**
+
+```bash
+sudo find /home /root -name authorized_keys -exec echo "── {}" \; -exec cat {} \;
+```
+
+```bash
+# Con huellas dactilares, para comparar con un inventario
+sudo ssh-keygen -l -f /home/alice/.ssh/authorized_keys
+```
+
+### Configurar el cliente: `~/.ssh/config`
+
+Este es el archivo que transforma el uso diario de SSH. Evita recordar IP, puertos y nombres de usuario.
+
+```text
+# ~/.ssh/config
+
+# ── Valores comunes a todos los hosts ─────────────────────────
+Host *
+    ServerAliveInterval 60            # mantener la conexión viva
+    ServerAliveCountMax 3
+    AddKeysToAgent yes                # añadir la clave al agente en 1er uso
+    HashKnownHosts yes
+    Compression yes
+
+# ── Un servidor simple ─────────────────────────────────────────
+Host web
+    HostName 203.0.113.10
+    User debian
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+
+# ── Un servidor en un puerto no estándar ───────────────────────
+Host prod-db
+    HostName db.exemple.be
+    User admin
+    Port 2222
+    IdentityFile ~/.ssh/id_prod
+    IdentitiesOnly yes                # probar SOLO esta clave
+
+# ── Un servidor accesible solo vía un rebote ────────────────────
+Host interne
+    HostName 10.0.0.42
+    User debian
+    ProxyJump web                     # pasa por el host "web" definido arriba
+
+# ── Un motivo: todos los servidores de un dominio ─────────────────
+Host *.exemple.be
+    User admin
+    IdentityFile ~/.ssh/id_pro
+
+# ── Reutilizar una conexión existente (acelera mucho) ────────
+Host lento
+    HostName lento.exemple.be
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist 10m
+```
+
+La conexión se convierte en:
+
+```bash
+ssh web
+ssh interne          # atraviesa automáticamente el rebote
+scp fichero.txt web:/tmp/
+```
+
+| Directiva | Rol |
+|-----------|------|
+| `HostName` | La dirección real |
+| `User` | La cuenta distante |
+| `Port` | El puerto |
+| `IdentityFile` | La clave a presentar |
+| `IdentitiesOnly yes` | No probar todas las claves del agente (evita `MaxAuthTries exceeded`) |
+| `ProxyJump` | Rebote por una máquina intermedia |
+| `ServerAliveInterval` | Evita cortes de sesiones inactivas |
+| `ControlMaster` / `ControlPersist` | Multiplexing: las conexiones siguientes reutilizan la primera, instantáneamente |
+
+> [!IMPORTANT]
+> A diferencia de la mayoría de archivos de configuración Linux, **SSH retiene el primer valor encontrado**, no el último. Los bloques más específicos deben por tanto colocarse **en la parte superior** del archivo, y el `Host *` **en la parte inferior**.
+
+Para crear la carpeta de sockets de multiplexing:
+
+```bash
+mkdir -p ~/.ssh/sockets && chmod 700 ~/.ssh/sockets
+```
+
+### `known_hosts` y huellas dactilares
+
+En la primera conexión:
+
+```text
+The authenticity of host '203.0.113.10 (203.0.113.10)' can't be established.
+ED25519 key fingerprint is SHA256:2Xk9pQr7…Qw8.
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+> [!IMPORTANT]
+> Esta pregunta no es una formalidad: es **la** protección contra el ataque del hombre en el medio. Responder `yes` sin verificar equivale a aceptar cualquier servidor que se presentara a esta dirección.
+>
+> La buena práctica: recuperar la huella dactilares por un canal independiente (consola del proveedor nube, documentación interna, salida de instalación) y compararla. En el servidor:
+>
+> ```bash
+> sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+> ```
+
+La huella dactilares aceptada se registra en `~/.ssh/known_hosts`. Si después cambia:
+
+```text
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+```
+
+Dos explicaciones posibles: el servidor se reinstáló (caso frecuente e inofensivo), o alguien se interpone (caso grave). **No retire la línea hasta haber determinado cuál.**
+
+```bash
+ssh-keygen -R 203.0.113.10                  # retirar la entrada de un host
+ssh-keygen -F 203.0.113.10                  # buscar una entrada
+ssh-keyscan -t ed25519 203.0.113.10         # recuperar la clave de host
+```
+
+### El agente SSH
+
+El agente mantiene sus claves desbloqueadas en memoria: la contraseña se solicita solo una vez por sesión.
+
+```bash
+eval "$(ssh-agent -s)"          # iniciar el agente (a menudo ya lanzado por el escritorio)
+ssh-add ~/.ssh/id_ed25519       # añadir una clave
+ssh-add -l                      # listar claves cargadas
+ssh-add -t 3600 ~/.ssh/id_prod  # cargar durante 1 hora solo
+ssh-add -D                      # descargar todas las claves
+```
+
+Para que las claves se añadan automáticamente, en `~/.ssh/config`:
+
+```text
+Host *
+    AddKeysToAgent yes
+```
+
+#### La transferencia de agente
+
+```bash
+ssh -A servidor                  # transferir el agente al servidor
+```
+
+Esto permite, desde el servidor, rebotar hacia una tercera máquina con sus claves locales — sin jamás copiar allí una clave privada.
+
+> [!CAUTION]
+> **La transferencia de agente es arriesgada.** Mientras su sesión esté abierta, el administrador (o cualquier atacante que haya obtenido root) en la máquina intermedia puede usar el socket de su agente para autenticarse **en todas partes donde sus claves dan acceso**.
+>
+> No la active nunca globalmente (`ForwardAgent yes` bajo `Host *`). Prefiera **`ProxyJump`**, que alcanza el mismo resultado sin jamás exponer el agente en la máquina de rebote:
+>
+> ```bash
+> ssh -J rebote destino
+> ```
+
+### Túneles y rebotes
+
+```bash
+# Rebote: alcanzar una máquina vía otra
+ssh -J rebote@bastion admin@10.0.0.42
+
+# Túnel LOCAL: exponer un servicio distante en mi máquina
+# Aquí, la base distante (accesible solo localmente en el servidor)
+# se hace alcanzable en localhost:5433
+ssh -L 5433:localhost:5432 admin@servidor
+
+# Túnel DISTANTE: exponer un servicio local en el servidor
+ssh -R 8080:localhost:3000 admin@servidor
+
+# Proxy SOCKS: hacer pasar un navegador por el servidor
+ssh -D 1080 admin@servidor
+```
+
+```text
+Túnel local  (-L)    mi máquina:5433  ──►  servidor  ──►  db:5432
+Túnel distante (-R)   servidor:8080     ──►  mi máquina:3000
+Proxy SOCKS   (-D)    mi máquina:1080  ──►  servidor  ──►  Internet
+```
+
+| Opción útil | Efecto |
+|--------------|-------|
+| `-N` | No ejecutar comando — solo túnel |
+| `-f` | Pasar a segundo plano |
+| `-T` | No asignar terminal |
+
+```bash
+ssh -fNT -L 5433:localhost:5432 admin@servidor      # túnel en segundo plano
+```
+
+El caso de uso típico: acceder a una base de datos que solo escucha en `127.0.0.1` del servidor, desde su cliente gráfico local — sin jamás exponerla en la red.
+
+### Transferir archivos
+
+```bash
+# scp — simple, adaptado a transferencias puntuales
+scp fichero.txt admin@servidor:/srv/data/
+scp -r carpeta/ admin@servidor:/srv/
+scp admin@servidor:/var/log/app.log ./
+
+# rsync — incremental, retoma donde se detuvo: la opción correcta cuando se repite
+rsync -avz --progress carpeta/ admin@servidor:/srv/carpeta/
+rsync -avzAX --delete /srv/data/ admin@servidor:/backup/data/
+
+# sftp — sesión interactiva
+sftp admin@servidor
+```
+
+`rsync` se beneficia de su `~/.ssh/config`: `rsync -av carpeta/ web:/srv/` funciona con el alias `web`.
+
+> [!TIP]
+> Opciones `rsync` a conocer: `-a` (archive: permisos, fechas, enlaces), `-v` (verboso), `-z` (compresión), `-A` (**ACL**), `-X` (atributos extendidos), `--delete` (espejo exacto — **destructivo**, probar primero con `--dry-run`).
+
+### fail2ban
+
+`fail2ban` lee los logs, detecta intentos de autenticación repetidos y banea temporalmente las IP culpables a nivel de cortafuegos.
+
+```bash
+sudo apt install fail2ban
+```
+
+La configuración **nunca** se modifica en `jail.conf` (sobrescrita en actualizaciones) sino en `jail.local`:
+
+```text
+# /etc/fail2ban/jail.local
+
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+ignoreip = 127.0.0.1/8 192.168.1.0/24      # nunca banearse a sí mismo
+
+[sshd]
+enabled  = true
+port     = ssh
+maxretry = 3
+bantime  = 24h
+```
+
+```bash
+sudo systemctl enable --now fail2ban
+sudo fail2ban-client status
+sudo fail2ban-client status sshd
+```
+
+```text
+Status for the jail: sshd
+|- Filter
+|  |- Currently failed: 2
+|  |- Total failed:     1847
+|  `- Journal matches:  _SYSTEMD_UNIT=sshd.service
+`- Actions
+   |- Currently banned: 5
+   |- Total banned:     213
+   `- Banned IP list:   203.0.113.66 198.51.100.4 …
+```
+
+```bash
+sudo fail2ban-client set sshd unbanip 203.0.113.66     # desbanear
+```
+
+> [!IMPORTANT]
+> Complete `ignoreip` con sus propias redes **antes** de activar el servicio. Banearse a sí mismo de su propio servidor por fail2ban tras tres errores de escritura es un gran clásico.
+>
+> Tenga en cuenta: si `PasswordAuthentication` ya está en `no`, lo esencial del ataque de fuerza bruta ya está neutralizado. fail2ban sigue siendo útil para reducir el ruido en los logs y la carga.
+
+### Diagnóstico SSH
+
+#### Del lado del cliente: el modo verboso
+
+```bash
+ssh -v username@servidor          # verboso
+ssh -vvv username@servidor        # muy verboso
+```
+
+Las líneas a buscar en la salida:
+
+```text
+debug1: Offering public key: /home/alice/.ssh/id_ed25519 ED25519 SHA256:2Xk9…
+debug1: Authentications that can continue: publickey,password
+debug1: Server accepts key: /home/alice/.ssh/id_ed25519
+```
+
+#### Del lado del servidor: los logs
+
+```bash
+sudo journalctl -u ssh -f              # Debian
+sudo journalctl -u sshd -f             # RHEL
+sudo tail -f /var/log/auth.log
+```
+
+```text
+sshd[1234]: Accepted publickey for alice from 203.0.113.5 port 51234 ssh2:
+  ED25519 SHA256:2Xk9pQr7…Qw8
+sshd[1235]: Failed password for invalid user admin from 198.51.100.4 port 40122 ssh2
+sshd[1236]: Authentication refused: bad ownership or modes for file /home/bob/.ssh/authorized_keys
+```
+
+Para un diagnóstico realmente detallado, se puede lanzar un segundo `sshd` en modo debug en otro puerto, sin tocar el servicio en producción:
+
+```bash
+sudo /usr/sbin/sshd -d -p 2223          # muestra todo, una conexión luego se detiene
+ssh -p 2223 username@servidor            # desde otro terminal
+```
+
+#### La lista de verificación `Permission denied (publickey)`
+
+Este es el error más frecuente. En orden:
+
+| # | Verificación | Comando |
+|---|--------------|----------|
+| 1 | ¿Se propone la clave? | `ssh -v` → buscar `Offering public key` |
+| 2 | ¿Se usa la clave correcta? | `ssh -i ~/.ssh/id_ed25519 user@servidor` |
+| 3 | ¿Está la clave pública en el servidor? | `grep "$(cut -d' ' -f2 ~/.ssh/id_ed25519.pub)" ~/.ssh/authorized_keys` |
+| 4 | ¿Son correctos los permisos? | `ls -ld ~ ~/.ssh ~/.ssh/authorized_keys` |
+| 5 | ¿Es el home escribible para el grupo? | `chmod g-w ~` |
+| 6 | ¿Está autorizado el usuario? | `sudo sshd -T \| grep -i allow` |
+| 7 | ¿Interfiere un bloque `Match`? | `sudo sshd -T -C user=alice,host=…,addr=…` |
+| 8 | ¿Ha etiquetado mal SELinux `.ssh`? | `restorecon -Rv ~/.ssh` |
+| 9 | ¿Está la cuenta bloqueada o expirada? | `sudo passwd -S alice` · `sudo chage -l alice` |
+
+> [!TIP]
+> El punto 8 es un gran clásico en RHEL: un `~/.ssh` creado por un script o copiado desde otro lugar lleva un contexto SELinux incorrecto, y `sshd` no puede leerlo — mientras que los permisos POSIX son perfectos. `restorecon -Rv ~/.ssh` resuelve el problema en un segundo. Ver la sección [SELinux](#selinux-rhel-fedora-centos-rocky).
+
+#### Otros síntomas
+
+| Mensaje | Causa probable |
+|---------|----------------|
+| `Connection refused` | `sshd` no escucha en este puerto, o cortafuegos en `REJECT` |
+| `Connection timed out` | Cortafuegos en `DROP`, IP incorrecta, o grupo de seguridad nube |
+| `Too many authentication failures` | El agente propone demasiadas claves → `IdentitiesOnly yes` |
+| `Host key verification failed` | Clave de host cambió → verificar, luego `ssh-keygen -R` |
+| `no matching host key type found` | Servidor antiguo, algoritmos obsoletos → `-o HostKeyAlgorithms=+ssh-rsa` |
+| `Broken pipe` tras inactividad | Falta keepalive → `ServerAliveInterval 60` |
+
+### Nombres de dominio personalizados — el archivo hosts
+
+Se pueden crear nombres de dominio locales en el archivo hosts:
+
+| OS | Ruta |
+|----|--------|
+| Linux / macOS | `/etc/hosts` |
+| Windows | `C:\Windows\System32\drivers\etc\hosts` |
+
+```text
+192.168.1.42      bf.devops25
+```
+
+```bash
+ssh username@bf.devops25
+```
+
+> [!CAUTION]
+> **El archivo hosts tiene prioridad sobre DNS.** Si coloca:
+> ```text
+> 127.0.0.1      www.google.com
+> ```
+> cada intento de conexión a Google será redirigido a su propia máquina.
+> Tenga cuidado por tanto con los nombres de dominio que asigna a sus servidores.
+>
+> Para un uso común, `~/.ssh/config` es preferible a `/etc/hosts`: no modifica la resolución de nombres de todo el sistema y no requiere derechos root.
+
+### Resumen SSH
+
+| Comando | Rol |
+|----------|------|
+| `ssh-keygen -t ed25519 -C "quien@máquina"` | Generar un par de claves |
+| `ssh-copy-id user@servidor` | Desplegar su clave pública |
+| `ssh-keygen -l -f cle.pub` | Huella dactilares de una clave |
+| `ssh-keygen -R hote` | Retirar un host de `known_hosts` |
+| `ssh-add -l` / `ssh-add -t 3600` | Gestionar el agente |
+| `sshd -t` | **Validar `sshd_config` antes de recargar** |
+| `sshd -T` | Mostrar la configuración efectiva |
+| `ssh -v` | Diagnosticar una conexión |
+| `ssh -J rebote destino` | Rebote (preferible a `-A`) |
+| `ssh -fNT -L 5433:localhost:5432 srv` | Túnel local en segundo plano |
+| `rsync -avzAX src/ srv:/dst/` | Sincronizar preservando las ACL |
+| `fail2ban-client status sshd` | Ver los baneos |
+
+**Los seis ajustes que importan en `sshd_config`:**
+
+```text
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AllowGroups sshusers
+MaxAuthTries 3
+LogLevel VERBOSE
+```
 
 ---
 
 ## AppArmor / SELinux
 
-(Contenido preservado del archivo original)
+### DAC contra MAC: ¿por qué una capa más?
+
+Todo lo que hemos visto hasta ahora — permisos POSIX, ACL, sudoers — pertenece al control de acceso **discrecional** (DAC, *Discretionary Access Control*): es el **propietario** de un archivo quien decide quién puede acceder a él. Y por encima de todo eso, root puede todo.
+
+AppArmor y SELinux añaden un control de acceso **obligatorio** (MAC, *Mandatory Access Control*): una política definida a nivel de sistema, aplicada por el **núcleo**, que ni el propietario de un archivo ni root pueden eludir sobre la marcha.
+
+**El escenario concreto:**
+
+> Se descubre una falla en su servidor web. Un atacante obtiene la ejecución de código arbitrario en el proceso `nginx`.
+>
+> - **Sin MAC**: el proceso corre como el usuario `www-data`. El atacante puede leer todo lo que `www-data` puede leer — por tanto `/etc/passwd`, archivos de otros sitios, copias de seguridad legibles por todos, y puede abrir conexiones de red salientes.
+> - **Con MAC**: el núcleo solo autoriza el proceso `nginx` a leer `/var/www/`, escribir en `/var/log/nginx/` y escuchar en los puertos 80 y 443. Cualquier otro intento es rechazado **incluso si los permisos POSIX lo permitían**. La compromisión queda confinada.
+
+Es una defensa en profundidad: no reemplaza los permisos, pone un techo a los daños cuando todo lo demás ha fallado.
+
+| | AppArmor | SELinux |
+|---|---|---|
+| **Distribuciones** | Debian, Ubuntu, SUSE | RHEL, Fedora, CentOS, Rocky, Alma |
+| **Enfoque** | Perfiles por **ruta** de binario | **Etiquetas** (*labels*) en cada archivo y proceso |
+| **Unidad de política** | Un archivo de perfil por ejecutable | Una política global + contextos |
+| **Si el archivo se mueve** | El perfil ya no se aplica | La etiqueta sigue el archivo |
+| **Complejidad** | Legible, rápido de aprender | Mucho más fino, pero más abrupto |
+| **Archivos de config** | `/etc/apparmor.d/` | `/etc/selinux/`, etiquetas en el sistema de archivos |
+
+### Saber qué corre en la máquina
+
+```bash
+# ¿AppArmor presente y activo?
+sudo aa-status
+cat /sys/module/apparmor/parameters/enabled       # Y o N
+
+# ¿SELinux presente y activo?
+sestatus
+getenforce
+```
+
+---
+
+## AppArmor (Debian, Ubuntu, SUSE)
+
+### 1. Verificar el estado
+
+```bash
+sudo aa-status
+```
+
+```text
+apparmor module is loaded.
+32 profiles are loaded.
+29 profiles are in enforce mode.
+   /usr/bin/man
+   /usr/sbin/nginx
+   /usr/sbin/tcpdump
+   ...
+3 profiles are in complain mode.
+   /usr/local/bin/backup.sh
+   ...
+2 processes have profiles defined.
+2 processes are in enforce mode.
+   /usr/sbin/nginx (1234)
+   /usr/sbin/nginx (1235)
+0 processes are in complain mode.
+0 processes are unconfined but have a profile defined.
+```
+
+### 2. Los tres modos
+
+| Modo | Comportamiento | Comando |
+|------|----------------|---------|
+| **enforce** | Bloquea todo lo que no está explícitamente permitido, y lo registra | `sudo aa-enforce /usr/sbin/nginx` |
+| **complain** | No impide nada, pero **registra** todo lo que habría sido bloqueado | `sudo aa-complain /usr/sbin/nginx` |
+| **disabled** | El perfil se ignora | `sudo aa-disable /usr/sbin/nginx` |
+
+> [!TIP]
+> El modo **complain** es la herramienta central del trabajo con AppArmor: se pone un perfil en complain, se ejecuta la aplicación con normalidad durante unos días, se recopila todo lo que ha intentado hacer realmente y luego se pasa a enforce. Nunca se adivina un perfil, se observa.
+
+Estos comandos provienen del paquete:
+
+```bash
+sudo apt install apparmor-utils apparmor-profiles
+```
+
+### 3. Anatomía de un perfil
+
+Los perfiles viven en `/etc/apparmor.d/`. El nombre del archivo reproduce la ruta del binario, con las `/` sustituidas por `.`:
+
+| Binario | Archivo de perfil |
+|---------|-------------------|
+| `/usr/sbin/nginx` | `/etc/apparmor.d/usr.sbin.nginx` |
+| `/usr/local/bin/backup.sh` | `/etc/apparmor.d/usr.local.bin.backup.sh` |
+
+Aquí tienes un perfil completo y comentado, que confina un script de copia de seguridad casero:
+
+```text
+# /etc/apparmor.d/usr.local.bin.backup.sh
+
+abi <abi/3.0>,
+include <tunables/global>
+
+# La ruta del programa confinado, seguida del bloque de reglas
+/usr/local/bin/backup.sh {
+
+  # ── Abstracciones: bloques de reglas reutilizables proporcionados por el sistema
+  include <abstractions/base>          # lo mínimo vital (libc, /dev/null, locales…)
+  include <abstractions/bash>          # lo que necesita un script bash
+
+  # ── Capabilities: los privilegios finos de root que el programa necesita
+  capability dac_read_search,          # leer archivos a pesar de los permisos
+  capability chown,
+
+  # ── El propio script y sus intérpretes
+  /usr/local/bin/backup.sh r,
+  /bin/bash                ix,         # ejecutado DENTRO de este mismo perfil
+  /usr/bin/tar             mrix,
+  /usr/bin/gzip            mrix,
+  /usr/bin/find            mrix,
+
+  # ── Los datos: solo lectura en el origen
+  /srv/data/           r,
+  /srv/data/**         r,
+
+  # ── El destino: lectura y escritura
+  /var/backups/        rw,
+  /var/backups/**      rw,
+
+  # ── El registro
+  /var/log/backup.log  w,
+
+  # ── Prohibiciones explícitas (prioritarias sobre cualquier autorización)
+  deny /etc/shadow        rwklx,
+  deny /home/*/.ssh/**    rwklx,
+  deny /root/**           rwklx,
+}
+```
+
+**Las letras de permiso**, que constituyen lo esencial de la sintaxis:
+
+| Letra | Significado |
+|-------|-------------|
+| `r` | Lectura |
+| `w` | Escritura |
+| `a` | Solo adición al final del archivo (*append*) |
+| `k` | Bloqueo del archivo |
+| `l` | Creación de enlaces |
+| `m` | Proyección en memoria ejecutable (*mmap* — necesaria para binarios y bibliotecas) |
+| `ix` | Ejecutar **heredando** el perfil actual |
+| `Px` | Ejecutar bajo **su propio** perfil (que debe existir), con limpieza del entorno |
+| `Cx` | Ejecutar bajo un subperfil definido en este archivo |
+| `Ux` | Ejecutar **sin confinamiento** — a evitar, es un agujero en la política |
+
+**Los comodines de ruta:**
+
+| Patrón | Coincide con |
+|--------|--------------|
+| `/srv/data/*` | Los archivos **directamente** en `/srv/data/` |
+| `/srv/data/**` | Todo, **de forma recursiva**, bajo `/srv/data/` |
+| `/home/*/.config/` | El `.config` de cualquier usuario |
+| `/var/log/app-[0-9].log` | Una clase de caracteres |
+
+> [!IMPORTANT]
+> **Cada regla termina con una coma.** Es el error de sintaxis n.º 1 en los perfiles de AppArmor, y `apparmor_parser` lo señala con un número de línea poco explícito.
+>
+> En las versiones anteriores a AppArmor 3, la sintaxis de inclusión es `#include <abstractions/base>` (con el `#`, que aquí **no** es un comentario). La forma moderna `include <…>` es equivalente.
+
+Las abstracciones disponibles se encuentran en `/etc/apparmor.d/abstractions/` — hay para casi todo:
+
+```bash
+ls /etc/apparmor.d/abstractions/
+```
+
+```text
+apache2-common  base  bash  consoles  dbus  fonts  nameservice
+nis  openssl  perl  php  python  ssl_certs  user-tmp  wutmp  ...
+```
+
+### 4. Leer una denegación en los logs
+
+Es el reflejo que hay que adquirir: cuando una aplicación confinada se comporta de forma extraña, la respuesta está en los logs del kernel.
+
+```bash
+sudo dmesg | grep -i apparmor
+```
+
+```bash
+sudo journalctl -k | grep -i "apparmor=\"DENIED\""
+```
+
+O, si `auditd` está instalado:
+
+```bash
+sudo grep apparmor /var/log/audit/audit.log
+```
+
+Una denegación se lee así:
+
+```text
+audit: type=1400 audit(1765108800.123:456): apparmor="DENIED" operation="open"
+  profile="/usr/sbin/nginx" name="/srv/www/index.html" pid=1234 comm="nginx"
+  requested_mask="r" denied_mask="r" fsuid=33 ouid=0
+```
+
+| Campo | Lo que te dice |
+|-------|----------------|
+| `apparmor="DENIED"` | El acceso fue **bloqueado** (`ALLOWED` en modo complain) |
+| `operation="open"` | Lo que el programa intentaba hacer |
+| `profile="/usr/sbin/nginx"` | **Qué perfil** bloqueó |
+| `name="/srv/www/index.html"` | **Qué recurso** se pretendía |
+| `requested_mask="r"` | El derecho solicitado — aquí la lectura |
+
+La regla que falta se deduce directamente de las dos últimas filas: `/srv/www/** r,`.
+
+### 5. Crear un perfil, método completo
+
+Es el flujo de trabajo estándar, en cinco pasos.
+
+```bash
+# 1. Generar un esqueleto de perfil y lanzar la aplicación bajo vigilancia
+sudo aa-genprof /usr/local/bin/backup.sh
+```
+
+`aa-genprof` se queda a la espera. En **una segunda terminal**, se ejecuta la aplicación en todas sus condiciones de uso:
+
+```bash
+# 2. Ejercitar la aplicación: todos los casos de uso, incluidos los casos de error
+/usr/local/bin/backup.sh
+/usr/local/bin/backup.sh --full
+```
+
+```bash
+# 3. Volver a la primera terminal y pulsar "S" (Scan).
+#    aa-genprof propone cada acceso observado: Allow / Deny / Glob / Abort.
+#    Se responde una vez por acceso, luego "F" (Finish) para guardar.
+```
+
+```bash
+# 4. Dejar funcionar en complain unos días, luego recoger lo que falta
+sudo aa-logprof
+```
+
+```bash
+# 5. Pasar a enforce cuando ya no aparezca ninguna denegación
+sudo aa-enforce /usr/local/bin/backup.sh
+```
+
+> [!TIP]
+> `aa-logprof` es el comando que conviene relanzar periódicamente: relee los logs, presenta cada nuevo acceso observado y actualiza el perfil. Es él quien hace el grueso del trabajo — rara vez se escribe un perfil enteramente a mano.
+
+### 6. Modificar un perfil suministrado por un paquete
+
+Editar directamente `/etc/apparmor.d/usr.sbin.nginx` funciona, pero tus modificaciones entrarán en conflicto en la próxima actualización del paquete. El mecanismo previsto para ello es el directorio `local/`:
+
+```bash
+sudo nano /etc/apparmor.d/local/usr.sbin.nginx
+```
+
+```text
+# Permitir a nginx servir un docroot personalizado
+/srv/monsitio/** r,
+/var/log/monsitio/*.log w,
+```
+
+El perfil principal ya contiene, al final del bloque, la línea `include <local/usr.sbin.nginx>` que carga este archivo.
+
+### 7. Recargar
+
+```bash
+# Recargar un perfil concreto
+sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.nginx
+
+# Verificar la sintaxis sin cargar
+sudo apparmor_parser -Q /etc/apparmor.d/usr.sbin.nginx
+
+# Recargar todo
+sudo systemctl reload apparmor
+```
+
+> [!CAUTION]
+> Un perfil de AppArmor solo se aplica a un proceso **en el momento de su ejecución**. Recargar el perfil de un servicio ya iniciado no reconfina el proceso en curso: hay que reiniciar el servicio.
+>
+> ```bash
+> sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.nginx
+> sudo systemctl restart nginx
+> ```
+
+---
+
+## SELinux (RHEL, Fedora, CentOS, Rocky)
+
+### 1. Los modos y el estado
+
+```bash
+sestatus
+```
+
+```text
+SELinux status:                 enabled
+SELinuxfs mount:                /sys/fs/selinux
+Loaded policy name:             targeted
+Current mode:                   enforcing
+Mode from config file:          enforcing
+Policy MLS status:              enabled
+Policy deny_unknown status:     allowed
+Max kernel policy version:      33
+```
+
+| Modo | Comportamiento |
+|------|----------------|
+| **Enforcing** | Aplica la política y bloquea |
+| **Permissive** | No impide nada, pero registra todo lo que habría sido bloqueado |
+| **Disabled** | SELinux está completamente desactivado |
+
+```bash
+getenforce                  # modo actual
+sudo setenforce 0           # pasar a permisivo — TEMPORAL, se pierde al reiniciar
+sudo setenforce 1           # volver a enforcing
+```
+
+El modo permanente está en `/etc/selinux/config`:
+
+```text
+# /etc/selinux/config
+SELINUX=enforcing
+# SELINUX puede valer: enforcing | permissive | disabled
+SELINUXTYPE=targeted
+```
+
+> [!CAUTION]
+> **Nunca pongas `SELINUX=disabled` para «hacer funcionar» una aplicación.** Es la respuesta equivocada a un problema real, y tiene un coste oculto: mientras SELinux está desactivado, los archivos nuevos no reciben etiqueta. El día que lo reactivas, nada arranca, y hay que reetiquetar todo el sistema:
+>
+> ```bash
+> sudo touch /.autorelabel && sudo reboot     # puede tardar largos minutos
+> ```
+>
+> Si tienes que depurar, usa **`permissive`**: la política sigue registrando todo lo que habría bloqueado, sin romper la producción, y la vuelta a `enforcing` es inmediata.
+
+### 2. El contexto de seguridad
+
+SELinux etiqueta **todo**: archivos, procesos, puertos, usuarios. Una etiqueta tiene cuatro campos:
+
+```text
+system_u : object_r : httpd_sys_content_t : s0
+   │          │              │              │
+ user      role           TYPE           nivel MLS
+```
+
+> [!IMPORTANT]
+> En la política `targeted` (la de todas las distribuciones por defecto), **solo cuenta el `type`** en la práctica. Los demás campos solo entran en juego en configuraciones multinivel (MLS), muy raras. Concéntrate en el campo que termina en `_t`.
+
+Los contextos se leen con la opción `-Z`, presente en la mayoría de los comandos:
+
+```bash
+ls -Z /var/www/html
+```
+
+```text
+unconfined_u:object_r:httpd_sys_content_t:s0 index.html
+```
+
+```bash
+ps -eZ | grep nginx
+```
+
+```text
+system_u:system_r:httpd_t:s0    1234 ?  00:00:00 nginx
+```
+
+```bash
+id -Z                      # mi propio contexto
+netstat -Z / ss -Z         # contexto de los sockets
+```
+
+### 3. El principio del Type Enforcement
+
+La política es una lista de reglas de la forma: *un proceso de tipo A puede realizar tal acción sobre un objeto de tipo B*.
+
+```text
+Proceso nginx    →  httpd_t
+Archivo servido  →  httpd_sys_content_t
+Regla            →  allow httpd_t httpd_sys_content_t : file { read getattr open };
+```
+
+Consecuencia directa, y causa del 90 % de los problemas encontrados: **un archivo creado en el lugar equivocado o movido con `mv` lleva la etiqueta equivocada**, y el servicio no puede leerlo — ni siquiera con `chmod 777`.
+
+```bash
+# La trampa clásica: cp respeta el contexto de destino, mv conserva el de origen
+cp archivo.html /var/www/html/      # ✅ toma httpd_sys_content_t
+mv ~/archivo.html /var/www/html/    # ❌ conserva user_home_t → 403 Forbidden
+```
+
+### 4. Cambiar un contexto
+
+**Temporalmente** — se pierde en el próximo reetiquetado:
+
+```bash
+sudo chcon -t httpd_sys_content_t /var/www/html/index.html
+sudo chcon -R -t httpd_sys_content_t /var/www/html/
+```
+
+**Definitivamente** — se registra la regla en la política y luego se aplica:
+
+```bash
+# 1. Declarar la regla para esta ruta (y todo lo que contiene)
+sudo semanage fcontext -a -t httpd_sys_content_t "/srv/monsitio(/.*)?"
+
+# 2. Aplicar la regla a los archivos ya presentes
+sudo restorecon -Rv /srv/monsitio
+```
+
+| Comando | Alcance |
+|---------|---------|
+| `chcon` | Cambia la etiqueta **ahora**, sin memoria — un `restorecon` la sobrescribe |
+| `semanage fcontext -a` | Registra la regla **en la política** — es la fuente de verdad |
+| `restorecon` | Reaplica a los archivos lo que dice la política |
+
+> [!TIP]
+> **El reflejo que hay que recordar: `semanage fcontext` y luego `restorecon`.** `chcon` es práctico para probar una hipótesis en treinta segundos, pero nunca debe quedarse en un procedimiento de instalación.
+>
+> `semanage` viene del paquete `policycoreutils-python-utils` (`sudo dnf install policycoreutils-python-utils`).
+
+Consultar las reglas registradas:
+
+```bash
+sudo semanage fcontext -l | grep monsitio
+```
+
+### 5. Los booleanos
+
+Muchos comportamientos habituales ya están previstos por la política y se controlan con simples interruptores. Es la solución más limpia para un gran número de bloqueos.
+
+```bash
+getsebool -a | grep httpd
+```
+
+```text
+httpd_can_network_connect --> off
+httpd_can_network_connect_db --> off
+httpd_can_sendmail --> off
+httpd_enable_homedirs --> off
+httpd_use_nfs --> off
+```
+
+```bash
+# -P hace el cambio permanente (persistente tras reiniciar)
+sudo setsebool -P httpd_can_network_connect on
+```
+
+Algunos booleanos que se encuentran muy a menudo:
+
+| Booleano | Activar cuando… |
+|----------|-----------------|
+| `httpd_can_network_connect` | El servidor web debe llamar a una API o a un backend (reverse proxy) |
+| `httpd_can_network_connect_db` | El servidor web se conecta a una base de datos remota |
+| `httpd_enable_homedirs` | El servidor web sirve archivos desde `/home` |
+| `ftpd_full_access` | El servidor FTP debe acceder a todo el sistema de archivos |
+| `nis_enabled` | Autenticación mediante NIS/LDAP en algunos casos |
+
+### 6. Los puertos
+
+SELinux también etiqueta los puertos. Hacer que un servicio escuche en un puerto no estándar exige, por tanto, declararlo.
+
+```bash
+# ¿Qué puertos están permitidos para el tipo ssh_port_t?
+sudo semanage port -l | grep ssh
+```
+
+```text
+ssh_port_t                     tcp      22
+```
+
+```bash
+# Permitir a sshd escuchar en el puerto 2222
+sudo semanage port -a -t ssh_port_t -p tcp 2222
+```
+
+```bash
+# Ídem para un servidor web en el puerto 8080
+sudo semanage port -a -t http_port_t -p tcp 8080
+```
+
+> [!IMPORTANT]
+> Cambiar el puerto de un servicio exige **tres** acciones coherentes, y es fácil olvidar una:
+> 1. modificar la configuración del servicio (`Port 2222` en `sshd_config`);
+> 2. abrir el puerto en el cortafuegos (`firewall-cmd --permanent --add-port=2222/tcp`);
+> 3. declarar el puerto a SELinux (`semanage port -a`).
+
+### 7. Diagnosticar una denegación
+
+Las denegaciones de SELinux se llaman **AVC denials** (*Access Vector Cache*).
+
+```bash
+sudo ausearch -m AVC -ts recent
+```
+
+```text
+type=AVC msg=audit(1765108800.123:456): avc:  denied  { read } for  pid=1234
+  comm="nginx" name="index.html" dev="sda1" ino=12345
+  scontext=system_u:system_r:httpd_t:s0
+  tcontext=unconfined_u:object_r:user_home_t:s0
+  tclass=file permissive=0
+```
+
+El mensaje se lee como una frase:
+
+| Campo | Lectura |
+|-------|---------|
+| `denied { read }` | La acción denegada |
+| `comm="nginx"` | El programa afectado |
+| `scontext=…httpd_t` | **Origen**: el tipo del proceso |
+| `tcontext=…user_home_t` | **Destino**: el tipo del objeto pretendido — ahí está la anomalía |
+| `tclass=file` | La clase de objeto |
+| `permissive=0` | 0 = realmente bloqueado; 1 = solo registrado |
+
+Aquí está todo dicho: un proceso `httpd_t` intentó leer un archivo que se quedó etiquetado como `user_home_t`. La corrección es un `restorecon`.
+
+**Una ayuda más legible** la proporciona `setroubleshoot`:
+
+```bash
+sudo dnf install setroubleshoot-server
+sudo sealert -a /var/log/audit/audit.log
+```
+
+`sealert` traduce cada denegación a lenguaje corriente y propone el o los comandos correctivos — a menudo el booleano adecuado o el `semanage fcontext` adecuado.
+
+**Como último recurso**, cuando ningún booleano ni ninguna etiqueta existente es adecuado, se genera un módulo de política a medida:
+
+```bash
+# Examinar lo que permitiría la regla generada — A LEER antes de aplicar
+sudo ausearch -m AVC -ts recent | audit2allow -m monapp
+
+# Generar e instalar el módulo
+sudo ausearch -m AVC -ts recent | audit2allow -M monapp
+sudo semodule -i monapp.pp
+```
+
+> [!WARNING]
+> `audit2allow` autoriza **exactamente** lo que fue denegado, sin juzgar. Si una denegación proviene de un intento real de intrusión o de una aplicación mal configurada, acabas de inscribir el fallo en la política.
+> Lee siempre la salida de `audit2allow -m` antes de instalar el módulo, y no recurras a él sino después de haber descartado los booleanos y el reetiquetado.
+
+---
+
+## Método de diagnóstico
+
+Ante un servicio que se niega a acceder a un recurso aunque los permisos POSIX parezcan correctos:
+
+| Paso | AppArmor | SELinux |
+|------|----------|---------|
+| **1. Confirmar que es realmente el MAC** | `sudo aa-complain /usr/sbin/nginx` y volver a probar | `sudo setenforce 0` y volver a probar |
+| **2. Leer la denegación** | `sudo dmesg \| grep DENIED` | `sudo ausearch -m AVC -ts recent` |
+| **3. Corregir correctamente** | Añadir la regla en `/etc/apparmor.d/local/…` | Booleano (`setsebool -P`), etiqueta (`semanage fcontext` + `restorecon`) o puerto (`semanage port -a`) |
+| **4. Volver a cerrar** | `sudo aa-enforce /usr/sbin/nginx` | `sudo setenforce 1` |
+
+> [!CAUTION]
+> El paso 4 no es opcional. Un `setenforce 0` « solo para ver » que nunca se revierte es el modo de fallo más común de SELinux en producción: la máquina funciona meses sin ninguna protección y nadie se da cuenta.
+>
+> Verificación a integrar en sus controles regulares:
+> ```bash
+> getenforce                      # debe responder Enforcing
+> sudo aa-status | head -3        # debe anunciar perfiles en modo enforce
+> ```
+
+> [!TIP]
+> Cuando un servicio se niega obstinadamente a acceder a un archivo aunque los permisos POSIX sean correctos, piense en AppArmor/SELinux **antes** de buscar en otro lado. El modo *permissive* / *complain* permite confirmar el diagnóstico en treinta segundos, sin desactivar la protección.
 
 ---
 
 ## Resumen
 
-(Contenido preservado del archivo original)
+| Dominio | Comandos clave |
+|---------|----------------|
+| **ACL** | `getfacl`, `setfacl -m`, `setfacl -d -m`, `setfacl -x`, `setfacl -b`, `namei -l` |
+| **Sudo** | `sudo -l`, `sudoedit`, `visudo`, `visudo -c`, `/etc/sudoers.d/`, `sudoreplay` |
+| **Cortafuegos** | `ufw allow/deny/limit`, `firewall-cmd --permanent`, `iptables -L -v -n`, `nft list ruleset`, `ss -tulpn` |
+| **SSH** | `ssh-keygen -t ed25519`, `ssh-copy-id`, `sshd -t`, `sshd -T`, `ssh -v`, `~/.ssh/config` |
+| **AppArmor** | `aa-status`, `aa-complain`, `aa-enforce`, `aa-genprof`, `aa-logprof`, `apparmor_parser -r` |
+| **SELinux** | `sestatus`, `getenforce`, `ls -Z`, `semanage fcontext`, `restorecon`, `setsebool -P`, `ausearch`, `sealert` |
+
+### Los reflejos básicos en un servidor expuesto
+
+1. **SSH**: sin conexión root directa, sin autenticación por contraseña, claves `ed25519` con contraseña.
+2. **Cortafuegos**: activo, en lista blanca — todo cerrado excepto lo estrictamente necesario.
+3. **Sudo**: derechos explícitos y nominativos, lista blanca de comandos, nunca `NOPASSWD: ALL`, `sudoedit` antes que `sudo vim`.
+4. **Archivos**: las ACL para los casos finos, nunca `chmod 777` — y un `namei -l` antes de concluir que un permiso está roto.
+5. **MAC**: AppArmor o SELinux dejado en *enforcing*, nunca desactivado para esquivar un problema.
+6. **Actualizaciones** de seguridad aplicadas regularmente.
+7. **Logs** consultados — `auth.log`, `journalctl -t sudo`, `fail2ban-client status` — y no solo escritos.
+
+### El reflejo que atraviesa todo el capítulo
+
+> [!TIP]
+> **Mantenga siempre una segunda sesión abierta.**
+>
+> Ya sea que modifique `sshd_config`, el cortafuegos o el sudoers, la manipulación puede cortarle el acceso a la máquina. Una sesión ya autenticada, dejada abierta en paralelo, no se ve afectada por ninguno de estos cambios: es su puerta de escape, y cuesta diez segundos de abrir.
+>
+> Complétela, en operaciones de red, con una remisión a cero programada:
+>
+> ```bash
+> echo "ufw --force reset" | sudo at now + 5 minutes
+> ```
+>
+> Y verifique **antes** de recargar, cada vez que una herramienta lo permita:
+>
+> ```bash
+> sudo sshd -t              # SSH
+> sudo visudo -c            # sudoers
+> sudo nft -c -f /etc/nftables.conf   # nftables
+> sudo apparmor_parser -Q /etc/apparmor.d/monperfil
+> ```
 
 ---
 
